@@ -32,6 +32,34 @@
 extern "C" {
 #endif
 
+struct ubigen_info_raw {
+	__be32 leb_size;
+	__be32 peb_size;
+	__be32 min_io_size;
+	__be32 vid_hdr_offs;
+	__be32 data_offs;
+	__be32 ubi_ver;
+	__be32 vtbl_size;
+	__be32 max_volumes;
+	__be32 image_seq;
+	__be32 num_volumes;
+} __attribute__ ((packed));
+
+struct ubigen_vol_info_raw {
+	__be32 id;
+	__be32 type;
+	__be32 alignment;
+	__be32 data_pad;
+	__be32 usable_leb_size;
+	__u8 name[UBI_VOL_NAME_MAX+1];
+	__be32 name_len;
+	__be32 compat;
+	__be32 used_ebs;
+	__be64 bytes;
+	__u8 flags;
+	__be32 flash_later;
+} __attribute__ ((packed));
+
 /**
  * struct ubigen_info - libubigen information.
  * @leb_size: logical eraseblock size
@@ -88,6 +116,7 @@ struct ubigen_vol_info
 	int used_ebs;
 	long long bytes;
 	uint8_t flags;
+	int flash_later;
 };
 
 /**

@@ -36,10 +36,12 @@
 #include <libubigen.h>
 #include <libiniparser.h>
 #include <libubi.h>
+#include <mtd_swab.h>
 #include "common.h"
 
 static const char optionsstr[] =
 "-o, --output=<file name>     output file name\n"
+"-z, --meta=<file name>       output meta-data file name\n"
 "-p, --peb-size=<bytes>       size of the physical eraseblock of the flash\n"
 "                             this UBI image is created for in bytes,\n"
 "                             kilobytes (KiB), or megabytes (MiB)\n"
@@ -72,6 +74,7 @@ static const char usage[] =
 
 static const struct option long_options[] = {
 	{ .name = "output",         .has_arg = 1, .flag = NULL, .val = 'o' },
+	{ .name = "meta",           .has_arg = 1, .flag = NULL, .val = 'z' },
 	{ .name = "peb-size",       .has_arg = 1, .flag = NULL, .val = 'p' },
 	{ .name = "min-io-size",    .has_arg = 1, .flag = NULL, .val = 'm' },
 	{ .name = "sub-page-size",  .has_arg = 1, .flag = NULL, .val = 's' },
@@ -88,7 +91,9 @@ static const struct option long_options[] = {
 struct args {
 	const char *f_in;
 	const char *f_out;
+	const char *f_meta;
 	int out_fd;
+	int meta_fd;
 	int peb_size;
 	int min_io_size;
 	int subpage_size;
@@ -116,7 +121,7 @@ static int parse_opt(int argc, char * const argv[])
 		int key, error = 0;
 		unsigned long int image_seq;
 
-		key = getopt_long(argc, argv, "o:p:m:s:O:e:x:Q:vhV", long_options, NULL);
+		key = getopt_long(argc, argv, "o:z:p:m:s:O:e:x:Q:vhV", long_options, NULL);
 		if (key == -1)
 			break;
 
@@ -127,6 +132,14 @@ static int parse_opt(int argc, char * const argv[])
 			if (args.out_fd == -1)
 				return sys_errmsg("cannot open file \"%s\"", optarg);
 			args.f_out = optarg;
+			break;
+
+		case 'z':
+			args.meta_fd = open(optarg, O_CREAT | O_TRUNC | O_WRONLY,
+					   S_IWUSR | S_IRUSR | S_IRGRP | S_IWGRP | S_IROTH);
+			if (args.meta_fd == -1)
+				return sys_errmsg("cannot open file \"%s\"", optarg);
+			args.f_meta = optarg;
 			break;
 
 		case 'p':
@@ -242,12 +255,13 @@ static int parse_opt(int argc, char * const argv[])
 
 static int read_section(const struct ubigen_info *ui, const char *sname,
 			struct ubigen_vol_info *vi, const char **img,
-			struct stat *st)
+			uint64_t *psize)
 {
 	char buf[256];
 	const char *p;
 
 	*img = NULL;
+	*psize = 0;
 
 	if (strlen(sname) > 128)
 		return errmsg("too long section name \"%s\"", sname);
@@ -290,18 +304,36 @@ static int read_section(const struct ubigen_info *ui, const char *sname,
 	verbose(args.verbose, "volume type: %s",
 		vi->type == UBI_VID_DYNAMIC ? "dynamic" : "static");
 
+	/* Fetch flash_later */
+	sprintf(buf, "%s:flash_later", sname);
+	vi->flash_later = iniparser_getint(args.dict, buf, -1);
+	if (vi->flash_later == -1)
+		vi->flash_later = 0;
+	if (vi->flash_later != 0 && vi->flash_later != 1)
+		return errmsg("invalid value for flash_later(%d) in section \"%s\"",
+			      vi->flash_later, sname);
+
 	/* Fetch the name of the volume image file */
 	sprintf(buf, "%s:image", sname);
 	p = iniparser_getstring(args.dict, buf, NULL);
 	if (p) {
+		struct stat st;
+
+		if (vi->flash_later) {
+			return errmsg("both image and flash_later in section \"%s\"",
+				      sname);
+		}
+
 		*img = p;
-		if (stat(p, st))
+		if (stat(p, &st))
 			return sys_errmsg("cannot stat \"%s\" referred from section \"%s\"",
 					  p, sname);
-		if (st->st_size == 0)
+		if (st.st_size == 0)
 			return errmsg("empty file \"%s\" referred from section \"%s\"",
 				       p, sname);
-	} else if (vi->type == UBI_VID_STATIC)
+
+		*psize = st.st_size;
+	} else if (vi->type == UBI_VID_STATIC && !vi->flash_later)
 		return errmsg("image is not specified for static volume in section \"%s\"",
 			      sname);
 
@@ -329,12 +361,12 @@ static int read_section(const struct ubigen_info *ui, const char *sname,
 				      p, sname);
 
 		/* Make sure the image size is not larger than volume size */
-		if (*img && st->st_size > vi->bytes)
+		if (*img && *psize > vi->bytes)
 			return errmsg("error in section \"%s\": size of the image file "
 				      "\"%s\" is %lld, which is larger than volume size %lld",
-				      sname, *img, (long long)st->st_size, vi->bytes);
+				      sname, *img, (long long)*psize, vi->bytes);
 		verbose(args.verbose, "volume size: %lld bytes", vi->bytes);
-	} else {
+	} else if(!vi->flash_later) {
 		struct stat st;
 
 		if (!*img)
@@ -410,9 +442,13 @@ static int read_section(const struct ubigen_info *ui, const char *sname,
 	vi->data_pad = ui->leb_size % vi->alignment;
 	vi->usable_leb_size = ui->leb_size - vi->data_pad;
 	if (vi->type == UBI_VID_DYNAMIC)
-		vi->used_ebs = (vi->bytes + vi->usable_leb_size - 1) / vi->usable_leb_size;
+		// this is always 0 for dynamic volumes
+		vi->used_ebs = 0;
+	else if (vi->flash_later)
+		// this is used in the vid header only so we need it in ubiaddvoldata only
+		vi->used_ebs = 0;
 	else
-		vi->used_ebs = (st->st_size + vi->usable_leb_size - 1) / vi->usable_leb_size;
+		vi->used_ebs = (*psize + vi->usable_leb_size - 1) / vi->usable_leb_size;
 	vi->compat = 0;
 	return 0;
 }
@@ -501,7 +537,7 @@ int main(int argc, char * const argv[])
 	for (i = 0; i < sects; i++) {
 		const char *sname = iniparser_getsecname(args.dict, i);
 		const char *img = NULL;
-		struct stat st;
+		uint64_t img_size;
 		int fd, j;
 
 		if (!sname) {
@@ -514,7 +550,7 @@ int main(int argc, char * const argv[])
 			printf("\n");
 		verbose(args.verbose, "parsing section \"%s\"", sname);
 
-		err = read_section(&ui, sname, &vi[i], &img, &st);
+		err = read_section(&ui, sname, &vi[i], &img, &img_size);
 		if (err == -1)
 			goto out_free;
 
@@ -570,7 +606,7 @@ int main(int argc, char * const argv[])
 			verbose(args.verbose, "writing volume %d", vi[i].id);
 			verbose(args.verbose, "image file: %s", img);
 
-			err = ubigen_write_volume(&ui, &vi[i], args.ec, st.st_size, fd, args.out_fd);
+			err = ubigen_write_volume(&ui, &vi[i], args.ec, img_size, fd, args.out_fd);
 			close(fd);
 			if (err) {
 				errmsg("cannot write volume for section \"%s\"", sname);
@@ -590,12 +626,73 @@ int main(int argc, char * const argv[])
 		goto out_free;
 	}
 
+	if (args.f_meta) {
+		struct ubigen_info_raw ui_raw = {0};
+
+		if (ui.leb_size < 0 || ui.peb_size < 0 || ui.min_io_size < 0 ||
+		    ui.vid_hdr_offs < 0 || ui.data_offs < 0 || ui.ubi_ver < 0 ||
+		    ui.vtbl_size < 0 || ui.max_volumes < 0 || sects < 0)
+		{
+			errmsg("negative values in ubigen info");
+			goto out_free;
+		}
+
+		ui_raw.leb_size = cpu_to_be32(ui.leb_size);
+		ui_raw.peb_size = cpu_to_be32(ui.peb_size);
+		ui_raw.min_io_size = cpu_to_be32(ui.min_io_size);
+		ui_raw.vid_hdr_offs = cpu_to_be32(ui.vid_hdr_offs);
+		ui_raw.data_offs = cpu_to_be32(ui.data_offs);
+		ui_raw.ubi_ver = cpu_to_be32(ui.ubi_ver);
+		ui_raw.vtbl_size = cpu_to_be32(ui.vtbl_size);
+		ui_raw.max_volumes = cpu_to_be32(ui.max_volumes);
+		ui_raw.image_seq = cpu_to_be32(ui.image_seq);
+		ui_raw.num_volumes = cpu_to_be32(sects);
+
+		if (write(args.meta_fd, &ui_raw, sizeof(ui_raw)) != sizeof(ui_raw)) {
+			sys_errmsg("cannot write %zu bytes to the output file", sizeof(ui_raw));
+			goto out_free;
+		}
+
+		for (i = 0; i < sects; i++) {
+			struct ubigen_vol_info_raw vi_raw = {0};
+
+			if (vi[i].id < 0 || vi[i].type < 0 || vi[i].alignment < 0 ||
+			    vi[i].data_pad < 0 || vi[i].usable_leb_size < 0 ||
+			    vi[i].name_len < 0 || vi[i].compat < 0 ||
+			    vi[i].used_ebs < 0 || vi[i].bytes < 0 ||
+			    vi[i].bytes > UINT64_MAX || vi[i].flash_later < 0)
+			{
+				errmsg("negative values in volume info");
+				goto out_free;
+			}
+
+			vi_raw.id = cpu_to_be32(vi[i].id);
+			vi_raw.type = cpu_to_be32(vi[i].type);
+			vi_raw.alignment = cpu_to_be32(vi[i].alignment);
+			vi_raw.data_pad = cpu_to_be32(vi[i].data_pad);
+			vi_raw.usable_leb_size = cpu_to_be32(vi[i].usable_leb_size);
+			memcpy(vi_raw.name, vi[i].name, vi[i].name_len);
+			vi_raw.name_len = cpu_to_be32(vi[i].name_len);
+			vi_raw.compat = cpu_to_be32(vi[i].compat);
+			vi_raw.used_ebs = cpu_to_be32(vi[i].used_ebs);
+			vi_raw.bytes = cpu_to_be64(vi[i].bytes);
+			vi_raw.flags = vi[i].flags;
+			vi_raw.flash_later = cpu_to_be32(vi[i].flash_later);
+
+			if (write(args.meta_fd, &vi_raw, sizeof(vi_raw)) != sizeof(vi_raw)) {
+				sys_errmsg("cannot write %zu bytes to the output file", sizeof(vi_raw));
+				goto out_free;
+			}
+		}
+	}
+
 	verbose(args.verbose, "done");
 
 	free(vi);
 	iniparser_freedict(args.dict);
 	free(vtbl);
 	close(args.out_fd);
+	close(args.meta_fd);
 	return 0;
 
 out_free:
@@ -606,6 +703,8 @@ out_vtbl:
 	free(vtbl);
 out:
 	close(args.out_fd);
+	close(args.meta_fd);
 	remove(args.f_out);
+	remove(args.f_meta);
 	return err;
 }
