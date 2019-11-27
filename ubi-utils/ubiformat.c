@@ -37,6 +37,7 @@
 #include <stdlib.h>
 #include <getopt.h>
 #include <fcntl.h>
+#include <limits.h>
 
 #include <libubi.h>
 #include <libmtd.h>
@@ -62,11 +63,14 @@ struct args {
 	const char *image;
 	const char *node;
 	int node_fd;
+	unsigned long int mtd_offset;
+	unsigned long int mtd_offset_end;
 };
 
 static struct args args =
 {
 	.ubi_ver   = 1,
+	.mtd_offset_end = ULONG_MAX,
 };
 
 static const char doc[] = PROGRAM_NAME " version " VERSION
@@ -89,6 +93,8 @@ static const char optionsstr[] =
 "                             (default is 1)\n"
 "-Q, --image-seq=<num>        32-bit UBI image sequence number to use\n"
 "                             (by default a random number is picked)\n"
+"-o, --mtd-offset=<bytes>     MTD offset\n"
+"-m, --mtd-offset-end=<bytes> max MTD offset\n"
 "-y, --yes                    assume the answer is \"yes\" for all question\n"
 "                             this program would otherwise ask\n"
 "-q, --quiet                  suppress progress percentage information\n"
@@ -101,8 +107,8 @@ static const char usage[] =
 "\t\t\t[-Q <num>] [-f <file>] [-S <bytes>] [-e <value>] [-x <num>] [-y] [-q] [-v] [-h]\n"
 "\t\t\t[--sub-page-size=<bytes>] [--vid-hdr-offset=<offs>] [--no-volume-table]\n"
 "\t\t\t[--flash-image=<file>] [--image-size=<bytes>] [--erase-counter=<value>]\n"
-"\t\t\t[--image-seq=<num>] [--ubi-ver=<num>] [--yes] [--quiet] [--verbose]\n"
-"\t\t\t[--help] [--version]\n\n"
+"\t\t\t[--image-seq=<num>] [--ubi-ver=<num>] [--mtd-offset=<num>]\n"
+"\t\t\t[--mtd-offset-end=<num>] [--yes] [--quiet] [--verbose] [--help] [--version]\n\n"
 "Example 1: " PROGRAM_NAME " /dev/mtd0 -y - format MTD device number 0 and do\n"
 "           not ask questions.\n"
 "Example 2: " PROGRAM_NAME " /dev/mtd0 -q -e 0 - format MTD device number 0,\n"
@@ -121,6 +127,8 @@ static const struct option long_options[] = {
 	{ .name = "help",            .has_arg = 0, .flag = NULL, .val = 'h' },
 	{ .name = "version",         .has_arg = 0, .flag = NULL, .val = 'V' },
 	{ .name = "image-seq",       .has_arg = 1, .flag = NULL, .val = 'Q' },
+	{ .name = "mtd-offset",      .has_arg = 1, .flag = NULL, .val = 'o' },
+	{ .name = "mtd-offset-end",  .has_arg = 1, .flag = NULL, .val = 'm' },
 	{ NULL, 0, NULL, 0},
 };
 
@@ -133,7 +141,7 @@ static int parse_opt(int argc, char * const argv[])
 		int key, error = 0;
 		unsigned long int image_seq;
 
-		key = getopt_long(argc, argv, "nh?Vyqve:x:s:O:f:S:Q:", long_options, NULL);
+		key = getopt_long(argc, argv, "nh?Vyqve:x:s:O:f:S:Q:o:m:", long_options, NULL);
 		if (key == -1)
 			break;
 
@@ -190,6 +198,18 @@ static int parse_opt(int argc, char * const argv[])
 			if (error || image_seq > 0xFFFFFFFF)
 				return errmsg("bad UBI image sequence number: \"%s\"", optarg);
 			args.image_seq = image_seq;
+			break;
+
+		case 'o':
+			args.mtd_offset = simple_strtoul(optarg, &error);
+			if (error)
+				return errmsg("bad MTD offset: \"%s\"", optarg);
+			break;
+
+		case 'm':
+			args.mtd_offset_end = simple_strtoul(optarg, &error);
+			if (error)
+				return errmsg("bad MTD end offset: \"%s\"", optarg);
 			break;
 
 
@@ -408,7 +428,8 @@ static int mark_bad(const struct mtd_dev_info *mtd, struct ubi_scan_info *si, in
 }
 
 static int flash_image(libmtd_t libmtd, const struct mtd_dev_info *mtd,
-		       const struct ubigen_info *ui, struct ubi_scan_info *si)
+		       const struct ubigen_info *ui, struct ubi_scan_info *si,
+		       int start_eb, int end_eb)
 {
 	int fd, img_ebs, eb, written_ebs = 0, divisor, skip_data_read = 0;
 	off_t st_size;
@@ -433,7 +454,7 @@ static int flash_image(libmtd_t libmtd, const struct mtd_dev_info *mtd,
 
 	verbose(args.verbose, "will write %d eraseblocks", img_ebs);
 	divisor = img_ebs;
-	for (eb = 0; eb < mtd->eb_cnt; eb++) {
+	for (eb = start_eb; eb < mtd->eb_cnt; eb++) {
 		int err, new_len;
 		char buf[mtd->eb_size];
 		long long ec;
@@ -452,6 +473,11 @@ static int flash_image(libmtd_t libmtd, const struct mtd_dev_info *mtd,
 		if (args.verbose) {
 			normsg_cont("eraseblock %d: erase", eb);
 			fflush(stdout);
+		}
+
+		if (end_eb >= 0 && eb > end_eb) {
+			errmsg("eb is bigger than maxeb %d", eb);
+			goto out_close;
 		}
 
 		err = mtd_erase(libmtd, mtd, args.node_fd, eb);
@@ -543,13 +569,16 @@ out_close:
 
 static int format(libmtd_t libmtd, const struct mtd_dev_info *mtd,
 		  const struct ubigen_info *ui, struct ubi_scan_info *si,
-		  int start_eb, int novtbl)
+		  int start_eb, int end_eb, int novtbl)
 {
 	int eb, err, write_size;
 	struct ubi_ec_hdr *hdr;
 	struct ubi_vtbl_record *vtbl;
 	int eb1 = -1, eb2 = -1;
 	long long ec1 = -1, ec2 = -1;
+
+	if (end_eb < 0)
+		end_eb = mtd->eb_cnt;
 
 	write_size = UBI_EC_HDR_SIZE + mtd->subpage_size - 1;
 	write_size /= mtd->subpage_size;
@@ -559,12 +588,12 @@ static int format(libmtd_t libmtd, const struct mtd_dev_info *mtd,
 		return sys_errmsg("cannot allocate %d bytes of memory", write_size);
 	memset(hdr, 0xFF, write_size);
 
-	for (eb = start_eb; eb < mtd->eb_cnt; eb++) {
+	for (eb = start_eb; eb < end_eb; eb++) {
 		long long ec;
 
 		if (!args.quiet && !args.verbose) {
 			printf("\r" PROGRAM_NAME ": formatting eraseblock %d -- %2lld %% complete  ",
-			       eb, (long long)(eb + 1 - start_eb) * 100 / (mtd->eb_cnt - start_eb));
+			       eb, (long long)(eb + 1 - start_eb) * 100 / (end_eb - start_eb));
 			fflush(stdout);
 		}
 
@@ -672,6 +701,34 @@ out_free:
 	return -1;
 }
 
+static int offset2eb(struct mtd_dev_info *mtd, unsigned long int mtd_offset, int *pout)
+{
+	unsigned long int _eb_offset;
+
+	if (mtd_offset == ULONG_MAX)
+		return -1;
+
+	if (mtd_offset % mtd->eb_size) {
+		errmsg("MTD offset is %lu, but should be a multiple of EB size(%d)",
+		       mtd_offset, mtd->eb_size);
+		return -1;
+	}
+
+	_eb_offset = mtd_offset / mtd->eb_size;
+	if (_eb_offset > mtd->eb_cnt) {
+		errmsg("MTD offset is %lu(EB=%lu), which is higher than the EB count(%d)",
+			   mtd_offset, _eb_offset, mtd->eb_cnt);
+		return -1;
+	}
+	if (_eb_offset > INT_MAX) {
+		errmsg("_eb_offset is out of range");
+		return -1;
+	}
+
+	*pout = (int)_eb_offset;
+	return 0;
+}
+
 int main(int argc, char * const argv[])
 {
 	int err, verbose;
@@ -681,6 +738,8 @@ int main(int argc, char * const argv[])
 	libubi_t libubi;
 	struct ubigen_info ui;
 	struct ubi_scan_info *si;
+	int eb_offset;
+	int eb_offset_end;
 
 
 	err = parse_opt(argc, argv);
@@ -708,6 +767,19 @@ int main(int argc, char * const argv[])
 		       mtd.min_io_size);
 		goto out_close_mtd;
 	}
+
+	if (offset2eb(&mtd, args.mtd_offset, &eb_offset)) {
+		errmsg("invalid MTD offset");
+		goto out_close_mtd;
+	}
+
+	if (offset2eb(&mtd, args.mtd_offset_end, &eb_offset_end)) {
+		errmsg("invalid MTD end offset");
+		goto out_close_mtd;
+	}
+
+	// this variable holds the last EB that we're allowed to write to
+	eb_offset_end--;
 
 	if (!mtd_info.sysfs_supported) {
 		/*
@@ -902,7 +974,7 @@ int main(int argc, char * const argv[])
 	}
 
 	if (args.image) {
-		err = flash_image(libmtd, &mtd, &ui, si);
+		err = flash_image(libmtd, &mtd, &ui, si, eb_offset, eb_offset_end);
 		if (err < 0)
 			goto out_free;
 
@@ -910,11 +982,13 @@ int main(int argc, char * const argv[])
 		 * ubinize has create a UBI_LAYOUT_VOLUME_ID volume for image.
 		 * So, we don't need to create again.
 		 */
-		err = format(libmtd, &mtd, &ui, si, err, 1);
-		if (err)
+		err = format(libmtd, &mtd, &ui, si, err, eb_offset_end, 1);
+		if (err) {
+			errmsg("format failed: %d", err);
 			goto out_free;
+		}
 	} else {
-		err = format(libmtd, &mtd, &ui, si, 0, 0);
+		err = format(libmtd, &mtd, &ui, si, eb_offset, eb_offset_end, 0);
 		if (err)
 			goto out_free;
 	}
