@@ -673,7 +673,7 @@ static int format(libmtd_t libmtd, const struct mtd_dev_info *mtd,
 		printf("\n");
 
 	if (novtbl)
-		goto out_free;
+		goto out_success;
 
 	if (eb1 == -1 || eb2 == -1) {
 		errmsg("no eraseblocks for volume table");
@@ -693,6 +693,7 @@ static int format(libmtd_t libmtd, const struct mtd_dev_info *mtd,
 		goto out_free;
 	}
 
+out_success:
 	free(hdr);
 	return 0;
 
