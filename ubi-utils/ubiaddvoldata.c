@@ -420,7 +420,7 @@ int main(int argc, char * const argv[])
 		goto out_free_fli;
 	}
 
-	for (i=0; i<(argc-optind) / 2; i++) {
+	for (i=0; i<num_laters; i++) {
 		char *endptr;
 		const char *s_volid = argv[optind++];
 		const char *s_img = argv[optind++];
