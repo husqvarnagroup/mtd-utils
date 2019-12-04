@@ -87,6 +87,7 @@ nandbiterrs
 nandpagetest
 nandsubpagetest
 ubiattach
+ubiaddvoldata
 ubiblock
 ubicrc32
 ubidetach
